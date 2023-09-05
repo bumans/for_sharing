@@ -1,0 +1,144 @@
+---
+title: "for_yunqi"
+author: "Ben Umans"
+date: "2023-09-05"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+
+## Introduction
+This is to show in some more detail the topics discussed with Yunqi last week regarding use of ash and mash for looking at eQTL results from pseudobulked single-cell data.
+
+Data were collected from brain organoids under three conditions (10% (control), 1%, and 21% ambient oxygen).  The single-cell transcriptomes were classified into cell types, filtered on a variety of quality metrics, and pseudobulked.  MatrixEQTL was used to map cis eQTLs (50 kb range), using gene expression PCs as covariates, in each cell type and oxygen condition.  Here, I'll just look at one cell type as an example.
+```{r setup}
+library(tidyverse)
+library(qvalue)
+library(mashr)
+library(udr)
+library(ashr)
+```
+
+
+Import the results from MatrixEQTL
+```{r}
+matrixeqtl_output <- read_table(file = "/project2/gilad/umans/oxygen_eqtl/data/MatrixEQTL/output/combined_coarse_quality_filter10_072023/results_combined_control10_CyclingProgenitors_nominal.txt", col_names = TRUE)
+
+head(matrixeqtl_output)
+```
+
+There are 
+```{r}
+matrixeqtl_output$q <- qvalue(matrixeqtl_output$pvalue)$qvalue
+
+sum(matrixeqtl_output$q<0.05)
+```
+significant associations, corresponding to 
+```{r}
+matrixeqtl_output[which(matrixeqtl_output$q<0.05),"gene"] %>% unique() %>% nrow()
+```
+genes ("eGenes"; UCP2 and ADAR).
+
+## ASH
+Now I use ash on the output from MatrixEQTL, first recovering the SE from the output statistics.
+```{r}
+matrixeqtl_output <- matrixeqtl_output %>% mutate(se_beta=beta/statistic) 
+
+ash_output <- ash(matrixeqtl_output$beta, matrixeqtl_output$se_beta, mixcompdist = "normal")
+```
+
+I how have 
+```{r}
+cbind(ash_output$result, snps=matrixeqtl_output$snps, gene=matrixeqtl_output$gene) %>% filter(lfsr<0.05) %>% nrow()
+```
+tests with lfsr<0.05, corresponding to 
+```{r}
+cbind(ash_output$result, snps=matrixeqtl_output$snps, gene=matrixeqtl_output$gene) %>% filter(lfsr<0.05) %>% pull(gene) %>% unique() %>% length()
+```
+eGenes.  If I restrict this to only those genes tested in the three-condition mash case, I get 830 eGenes.
+
+## MASH
+
+Mash with only a single condition should be equivalent to ash.  I start by using the same input statistics from MatrixEQTL and passing them to the fastqtl2mash script to focus just on "strong" snp-gene pairs.  I then use this as input for mash.  Since there are not multiple conditions to compare across, I use only the canonical covariance matrices U.c.
+
+```{r}
+mash_one_condition_input <- readRDS("/project2/gilad/umans/oxygen_eqtl/data/MatrixEQTL/output/combined_coarse_quality_filter10_072023/mash/MatrixEQTLSumStats_Cycling10only.mash.rds")
+
+# https://stephenslab.github.io/udr/reference/ud_init.html
+# Use exchangeable zscore model by setting alpha = 1. 
+data.random = mash_set_data(as.matrix(mash_one_condition_input$random.b),
+                            as.matrix(mash_one_condition_input$random.s), alpha = 0)
+data.strong = mash_set_data(as.matrix(mash_one_condition_input$strong.b),
+                            as.matrix(mash_one_condition_input$strong.s), alpha = 0)
+# why do we use strong.b and not strong.z if alpha=1?
+U.c = cov_canonical(data.random)
+
+m = mash(data.random, Ulist = c(U.c), outputlevel = 1)
+m2 = mash(data.strong, g=get_fitted_g(m), fixg=TRUE)
+```
+
+This yields
+```{r}
+sum(m2$result$lfsr<0.05)
+```
+eGenes (as mash reports only the lead snp-eGene pair).
+
+For subsequent comparison, I estimate the mash model again using alpha=1 (ie, Z-scores), which yields
+```{r}
+mash_one_condition_input <- readRDS("/project2/gilad/umans/oxygen_eqtl/data/MatrixEQTL/output/combined_coarse_quality_filter10_072023/mash/MatrixEQTLSumStats_Cycling10only.mash.rds")
+
+
+# https://stephenslab.github.io/udr/reference/ud_init.html
+# Use exchangeable zscore model by setting alpha = 1. 
+data.random = mash_set_data(as.matrix(mash_one_condition_input$random.b),
+                            as.matrix(mash_one_condition_input$random.s), alpha = 1)
+data.strong = mash_set_data(as.matrix(mash_one_condition_input$strong.b),
+                            as.matrix(mash_one_condition_input$strong.s), alpha = 1)
+# why do we use strong.b and not strong.z if alpha=1?
+U.c = cov_canonical(data.random)
+
+m = mash(data.random, Ulist = c(U.c), outputlevel = 1)
+m2 = mash(data.strong, g=get_fitted_g(m), fixg=TRUE)
+sum(m2$result$lfsr<0.05)
+```
+eGenes.
+
+Now I use mash to combine MatrixEQTL output for this same cell type (Cycling Progenitors) from three different conditions.  The "raw" MatrixEQTL output finds 3 and 0 (1% oxygen condition and 21% oxygen condition) eGenes with any association test for which q<0.05.
+
+I used the fastqtl2mash again to prepare MatrixEQTL statistics for mash.  Here, I use the Z-scores method in order to take advantage of UDR, which will yield slightly different results from using the EE model, which I used above to compare ash to single-condition mash.  
+
+```{r, message=FALSE, results='hide'}
+mash_three_condition_input <- readRDS(file = "/project2/gilad/umans/oxygen_eqtl/data/MatrixEQTL/output/combined_coarse_quality_filter10_072023/mash/MatrixEQTLSumStats_CyclingProgenitorsonly.mash.rds")
+
+# estimate correlation for measurement overlap
+data.temp = mash_set_data(mash_three_condition_input$random.b, mash_three_condition_input$random.s)
+Vhat = estimate_null_correlation_simple(data.temp)
+rm(data.temp)
+
+# https://stephenslab.github.io/udr/reference/ud_init.html
+# Use exchangeable zscore model by setting alpha = 1. 
+data.random = mash_set_data(mash_three_condition_input$random.b, mash_three_condition_input$random.s, V=Vhat, alpha = 1)
+data.strong = mash_set_data(mash_three_condition_input$strong.b, mash_three_condition_input$strong.s, V=Vhat, alpha = 1)
+U.c = cov_canonical(data.random)
+
+V.em = mash_estimate_corr_em(data.random, Ulist = c(U.c), details = TRUE)
+data.random <- mash_update_data(mashdata = data.random, V = V.em$V, ref = NULL)
+data.strong <- mash_update_data(data.strong, V = V.em$V, ref = NULL)
+
+fit0 = ud_init(data.strong, n_rank1 = 0, n_unconstrained = 20)
+fit1 = ud_fit(fit0, control = list(unconstrained.update = "ted", maxiter  = 1e3), verbose=TRUE)
+U.ted <- lapply(fit1$U,function (e) "[["(e,"mat"))
+U.c = cov_canonical(data.random)
+
+m = mash(data.random, Ulist = c(U.ted, U.c), outputlevel = 1)
+m2 = mash(data.strong, g=get_fitted_g(m), fixg=TRUE)
+```
+Now, for the 10% oxygen condition, the mash output yields
+```{r}
+sum(m2$result$lfsr[,"CyclingProgenitors_control10_formash.out"]<0.05)
+```
+eGenes.  
+
+This would imply that the gain from having two additional conditions as input yields about 35 additional eGenes, with the vast majority of the gain over the MatrixEQTL output coming from m/ash.  However, mash and ash seem to disagree substantially.  How should I think about this?
+
